@@ -1,1 +1,6 @@
-NOT AVAILABLE
+ALB: ecs-express-gateway-alb-b8810e7d (internal), in vpc-0758ef1be26b0b173, subnets subnet-019740b3451933b42 and subnet-0778134c5dd79d94f
+ALB security group sg-0fd6088c41e31bcc0, which doesn’t appear to allow inbound 443 from the CloudShell environment’s group sg-03aab0d42a85f6848
+HTTPS:443 curl times out at TCP connect to 10.67.4.51 and 10.67.5.137, so no response comes back
+The Host-header rule matches cy-1c81d1fb1e714e9dbc6f8bbe90a93686.ecs.us-east-1.on.aws
+A target at 10.67.5.66:5000 is reported healthy in the ALB’s target group
+The VPC CloudShell environment can’t reach the EC2 API endpoint, so AWS CLI calls from that tab time out
