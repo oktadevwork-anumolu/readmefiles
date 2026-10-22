@@ -1,3 +1,8 @@
+$env:OKTA_ISSUER="https://loginqa.rnt.com"
+$env:OKTA_CLIENT_ID="0oa27z65..."
+$env:OKTA_CLIENT_SECRET="<secret from .env.local>"
+python okta_oidc_flow_test.py
+
 #!/usr/bin/env python3
 """
 Okta OIDC authorization-code + PKCE flow tester (stdlib only).
