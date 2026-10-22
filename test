@@ -1,6 +1,194 @@
-ALB: ecs-express-gateway-alb-b8810e7d (internal), in vpc-0758ef1be26b0b173, subnets subnet-019740b3451933b42 and subnet-0778134c5dd79d94f
-ALB security group sg-0fd6088c41e31bcc0, which doesn’t appear to allow inbound 443 from the CloudShell environment’s group sg-03aab0d42a85f6848
-HTTPS:443 curl times out at TCP connect to 10.67.4.51 and 10.67.5.137, so no response comes back
-The Host-header rule matches cy-1c81d1fb1e714e9dbc6f8bbe90a93686.ecs.us-east-1.on.aws
-A target at 10.67.5.66:5000 is reported healthy in the ALB’s target group
-The VPC CloudShell environment can’t reach the EC2 API endpoint, so AWS CLI calls from that tab time out
+#!/usr/bin/env python3
+"""
+Okta OIDC authorization-code + PKCE flow tester (stdlib only).
+
+Runs each step separately and reports exactly where it fails:
+  0. Discovery        - issuer/endpoints match the host you think you're using
+  1. Client-auth probe - dummy code: 401 => bad client creds/method, 400 => creds OK
+  2. Authorize        - opens browser, captures ?code= on a local callback server
+  3. Token exchange   - real code -> tokens (prints Okta error/WWW-Authenticate)
+  4. ID token checks  - iss / aud / nonce / exp (claims decoded, sig NOT verified)
+  5. Userinfo         - access token against /userinfo
+
+Usage (stop `next dev` first so port 8080 is free):
+  set OKTA_ISSUER=https://loginqa.rnt.com
+  set OKTA_CLIENT_ID=0oa...
+  set OKTA_CLIENT_SECRET=...
+  python okta_oidc_flow_test.py
+Options:
+  --redirect-uri http://localhost:8080/authorization-code/callback
+  --auth-method basic|post|none   (must match the Okta app's client auth setting)
+  --scope "openid profile email"
+"""
+import argparse, base64, hashlib, http.server, json, os, secrets, sys, threading, time
+import urllib.error, urllib.parse, urllib.request, webbrowser
+
+
+def b64url(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+
+
+def redact(v, keep=6):
+    return v if not isinstance(v, str) or len(v) <= keep * 2 else f"{v[:keep]}...{v[-keep:]}"
+
+
+def http_call(method, url, headers=None, data=None):
+    body = urllib.parse.urlencode(data).encode() if data else None
+    req = urllib.request.Request(url, data=body, method=method, headers=headers or {})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return r.status, dict(r.headers), r.read().decode()
+    except urllib.error.HTTPError as e:
+        return e.code, dict(e.headers), e.read().decode()
+
+
+def report(step, status, headers, body, ok_codes=(200,)):
+    mark = "OK  " if status in ok_codes else "FAIL"
+    print(f"\n[{mark}] {step}: HTTP {status}")
+    wa = headers.get("WWW-Authenticate") or headers.get("www-authenticate")
+    if wa:
+        print(f"       WWW-Authenticate: {wa}")
+    try:
+        j = json.loads(body)
+        safe = {k: (redact(v) if k in ("access_token", "id_token", "refresh_token") else v) for k, v in j.items()}
+        print("       " + json.dumps(safe, indent=2).replace("\n", "\n       "))
+        return j
+    except Exception:
+        print(f"       body: {body[:300]}")
+        return {}
+
+
+def token_request(token_ep, client_id, secret, method, form):
+    headers = {"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"}
+    form = dict(form)
+    if method == "basic":
+        cred = f"{urllib.parse.quote(client_id, safe='')}:{urllib.parse.quote(secret, safe='')}"
+        headers["Authorization"] = "Basic " + base64.b64encode(cred.encode()).decode()
+    elif method == "post":
+        form.update(client_id=client_id, client_secret=secret)
+    else:  # none (public client / PKCE only)
+        form["client_id"] = client_id
+    return http_call("POST", token_ep, headers, form)
+
+
+def decode_jwt_claims(jwt):
+    payload = jwt.split(".")[1]
+    return json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+
+
+def capture_code(redirect_uri, auth_url, timeout=180):
+    parsed = urllib.parse.urlparse(redirect_uri)
+    result = {}
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            u = urllib.parse.urlparse(self.path)
+            if u.path != parsed.path:
+                self.send_response(404); self.end_headers(); return
+            result.update({k: v[0] for k, v in urllib.parse.parse_qs(u.query).items()})
+            self.send_response(200); self.send_header("Content-Type", "text/html"); self.end_headers()
+            self.wfile.write(b"<h3>Callback received. Return to the terminal.</h3>")
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.HTTPServer((parsed.hostname, parsed.port or 80), Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    print(f"\nOpening browser to authorize endpoint (listening on {redirect_uri}) ...")
+    webbrowser.open(auth_url)
+    print(f"If the browser doesn't open, paste this URL:\n{auth_url}")
+    start = time.time()
+    while not result and time.time() - start < timeout:
+        time.sleep(0.3)
+    srv.shutdown()
+    return result
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--issuer", default=os.getenv("OKTA_ISSUER"))
+    ap.add_argument("--client-id", default=os.getenv("OKTA_CLIENT_ID"))
+    ap.add_argument("--client-secret", default=os.getenv("OKTA_CLIENT_SECRET", ""))
+    ap.add_argument("--redirect-uri", default=os.getenv("OKTA_REDIRECT_URI",
+                    "http://localhost:8080/authorization-code/callback"))
+    ap.add_argument("--auth-method", choices=["basic", "post", "none"], default="basic")
+    ap.add_argument("--scope", default="openid profile email")
+    a = ap.parse_args()
+    if not a.issuer or not a.client_id:
+        sys.exit("Set OKTA_ISSUER and OKTA_CLIENT_ID (and OKTA_CLIENT_SECRET unless --auth-method none).")
+
+    secret = a.client_secret
+    if secret != secret.strip() or secret.startswith(('"', "'")):
+        print("WARNING: client secret has surrounding whitespace or quotes - check your env file.")
+    print(f"Issuer: {a.issuer}\nClient: {a.client_id}\nSecret: {redact(secret, 3) if secret else '(none)'}"
+          f"\nAuth method: {a.auth_method}\nRedirect: {a.redirect_uri}")
+
+    # 0. Discovery
+    st, h, body = http_call("GET", a.issuer.rstrip("/") + "/.well-known/openid-configuration")
+    if st != 200:
+        report("Discovery", st, h, body); sys.exit(1)
+    disc = json.loads(body)
+    print(f"\n[OK  ] Discovery: issuer={disc['issuer']}\n       token_endpoint={disc['token_endpoint']}")
+    if disc["issuer"].rstrip("/") != a.issuer.rstrip("/"):
+        print("FAIL  issuer in discovery != configured issuer")
+
+    # 1. Client-auth probe with a dummy code
+    st, h, body = token_request(disc["token_endpoint"], a.client_id, secret, a.auth_method, {
+        "grant_type": "authorization_code", "code": "dummy-code",
+        "redirect_uri": a.redirect_uri, "code_verifier": "dummy-verifier-" + "x" * 30})
+    j = report("Client-auth probe (expect 400 invalid_grant)", st, h, body, ok_codes=(400,))
+    if st == 401 or j.get("error") == "invalid_client":
+        print("       => Client authentication is failing: wrong org, wrong/inactive secret, "
+              "or Okta app's client auth method != --auth-method.")
+        sys.exit(1)
+
+    # 2. Authorize
+    verifier = b64url(secrets.token_bytes(32))
+    challenge = b64url(hashlib.sha256(verifier.encode()).digest())
+    state, nonce = b64url(secrets.token_bytes(16)), b64url(secrets.token_bytes(16))
+    auth_url = disc["authorization_endpoint"] + "?" + urllib.parse.urlencode({
+        "client_id": a.client_id, "response_type": "code", "scope": a.scope,
+        "redirect_uri": a.redirect_uri, "state": state, "nonce": nonce,
+        "code_challenge": challenge, "code_challenge_method": "S256"})
+    cb = capture_code(a.redirect_uri, auth_url)
+    if not cb:
+        sys.exit("\n[FAIL] No callback received (timeout).")
+    if "error" in cb:
+        print(f"\n[FAIL] Authorize returned error: {cb}"); sys.exit(1)
+    if cb.get("state") != state:
+        print("\n[FAIL] state mismatch"); sys.exit(1)
+    print(f"\n[OK  ] Authorize: got code {redact(cb['code'], 4)}, state matches")
+
+    # 3. Token exchange
+    st, h, body = token_request(disc["token_endpoint"], a.client_id, secret, a.auth_method, {
+        "grant_type": "authorization_code", "code": cb["code"],
+        "redirect_uri": a.redirect_uri, "code_verifier": verifier})
+    tokens = report("Token exchange", st, h, body)
+    if st != 200:
+        sys.exit(1)
+
+    # 4. ID token claim checks (signature not verified here)
+    if "id_token" in tokens:
+        c = decode_jwt_claims(tokens["id_token"])
+        checks = {
+            "iss matches discovery": c.get("iss") == disc["issuer"],
+            "aud contains client_id": a.client_id in (c.get("aud") if isinstance(c.get("aud"), list) else [c.get("aud")]),
+            "nonce matches": c.get("nonce") == nonce,
+            "not expired": c.get("exp", 0) > time.time(),
+        }
+        print("\n[ID token] " + json.dumps({k: c.get(k) for k in ("iss", "aud", "sub", "email", "exp")}))
+        for k, ok in checks.items():
+            print(f"       {'OK  ' if ok else 'FAIL'} {k}")
+
+    # 5. Userinfo
+    if "access_token" in tokens and disc.get("userinfo_endpoint"):
+        st, h, body = http_call("GET", disc["userinfo_endpoint"],
+                                {"Authorization": f"Bearer {tokens['access_token']}"})
+        report("Userinfo", st, h, body)
+
+    print("\nDone. If all steps pass here, the Okta side is fine - the 401 in the app comes from "
+          "another call in the callback handler (log the failing URL there).")
+
+
+if __name__ == "__main__":
+    main()
